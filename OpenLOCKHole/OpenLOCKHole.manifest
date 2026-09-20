@@ -1,0 +1,13 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "id": "a3f3d7f5-7d24-4c28-a723-0b3c4d6a2e91",
+  "author": "fusion-openlock",
+  "description": {
+    "": "Add a Basic OpenLOCK hole profile to the active sketch."
+  },
+  "version": "0.1.0",
+  "runOnStartup": false,
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}
