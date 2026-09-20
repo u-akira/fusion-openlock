@@ -27,18 +27,24 @@ BASIC_OPENLOCK_DIMENSIONS_MM = {
     "bottom_flat_from_slot_wall": 2.97,
     "center_slot_half_width": 0.80,
     "center_slot_depth_from_bottom": 7.20,
+    "center_slot_corner_fillet_radius": 0.50,
     "slope_angle": 135.0,
 }
 
+# Vertex indices in basic_openlock_profile_mm() for the two slot-mouth and
+# two slot-ceiling corners, following the polygon's point order.
+BASIC_OPENLOCK_FILLET_CORNER_INDICES = (0, 15, 16, 17)
+
 
 def basic_openlock_profile_mm():
-    """Return the closed Basic OpenLOCK hole outline in mm.
+    """Return the nominal sharp-corner Basic OpenLOCK outline in mm.
 
     The profile is a single concave polygon, symmetric about the vertical
     centerline. The central slot opens from the bottom and is 1.6 mm wide by
     7.20 mm deep. The profile preserves the measured 4.76 mm shelf position,
     5.50 mm top-to-shelf height, 1.00 mm shoulder, and the two distinct
-    diagonal transitions visible in the reference drawing.
+    diagonal transitions visible in the reference drawing. The Fusion add-in
+    replaces the four listed central-slot corners with R0.50 mm sketch arcs.
     """
 
     d = BASIC_OPENLOCK_DIMENSIONS_MM

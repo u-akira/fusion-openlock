@@ -218,11 +218,22 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
                 _reference_profile_placement(sketch, inputs)
             )
 
-            created_lines = _add_closed_profile(sketch, points_mm)
+            created_lines, created_arcs = _add_closed_profile(
+                sketch,
+                points_mm,
+                profile["BASIC_OPENLOCK_DIMENSIONS_MM"]["center_slot_corner_fillet_radius"],
+                profile["BASIC_OPENLOCK_FILLET_CORNER_INDICES"],
+            )
             try:
-                _constrain_profile_shape(sketch, created_lines, reference_line)
-                _write_profile_attributes(
+                _constrain_profile_shape(
+                    sketch,
                     created_lines,
+                    created_arcs,
+                    reference_line,
+                    points_mm,
+                )
+                _write_profile_attributes(
+                    created_lines + list(created_arcs.values()),
                     origin_mm,
                     rotation_deg,
                     flip,
@@ -232,9 +243,7 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
                     offset_mm=offset_mm,
                 )
             except Exception:
-                for line in reversed(created_lines):
-                    if line.isValid and line.isDeletable:
-                        line.deleteMe()
+                _delete_profile_geometry(created_lines, created_arcs)
                 raise
 
         except Exception:
@@ -261,8 +270,13 @@ class PreviewHandler(adsk.core.CommandEventHandler):
                 args.isValidResult = False
                 return
 
-            _, points_mm, _, _, _, _, _ = _reference_profile_placement(sketch, inputs)
-            _add_closed_profile(sketch, points_mm)
+            profile, points_mm, _, _, _, _, _ = _reference_profile_placement(sketch, inputs)
+            _add_closed_profile(
+                sketch,
+                points_mm,
+                profile["BASIC_OPENLOCK_DIMENSIONS_MM"]["center_slot_corner_fillet_radius"],
+                profile["BASIC_OPENLOCK_FILLET_CORNER_INDICES"],
+            )
             # Keep the preview transaction temporary. Fusion rolls it back before
             # ExecuteHandler runs, which then creates the fully constrained result.
             args.isValidResult = False
@@ -308,9 +322,10 @@ def _sketch_line_endpoints_mm(line):
     )
 
 
-def _add_closed_profile(sketch, points_mm):
+def _add_closed_profile(sketch, points_mm, fillet_radius_mm, fillet_corner_indices):
     lines = sketch.sketchCurves.sketchLines
     created_lines = []
+    created_arcs = {}
     first_line = None
     previous_end = None
 
@@ -327,13 +342,38 @@ def _add_closed_profile(sketch, points_mm):
             if first_line is None:
                 first_line = line
             previous_end = line.endSketchPoint
+
+        arcs = sketch.sketchCurves.sketchArcs
+        radius_cm = fillet_radius_mm * MM_TO_CM
+        for corner_index in fillet_corner_indices:
+            incoming_line = created_lines[(corner_index - 1) % len(created_lines)]
+            outgoing_line = created_lines[corner_index]
+            arc = arcs.addFillet(
+                incoming_line,
+                incoming_line.endSketchPoint.geometry,
+                outgoing_line,
+                outgoing_line.startSketchPoint.geometry,
+                radius_cm,
+            )
+            if not arc:
+                raise RuntimeError("Fusion could not create an OpenLOCK sketch fillet.")
+            created_arcs[corner_index] = arc
     except Exception:
-        for line in reversed(created_lines):
-            if line.isValid and line.isDeletable:
-                line.deleteMe()
+        _delete_profile_geometry(created_lines, created_arcs)
         raise
 
-    return created_lines
+    return created_lines, created_arcs
+
+
+def _delete_profile_geometry(lines, arcs_by_corner):
+    """Delete added arcs before their trimmed profile lines."""
+
+    for arc in reversed(list(arcs_by_corner.values())):
+        if arc.isValid and arc.isDeletable:
+            arc.deleteMe()
+    for line in reversed(lines):
+        if line.isValid and line.isDeletable:
+            line.deleteMe()
 
 
 def _line_length_cm(line):
@@ -364,11 +404,25 @@ def _dimension_text_point(line, counter_clockwise, offset_cm=0.45):
 
 def _angle_dimension_text_point(incoming_line, outgoing_line, offset_cm=0.25):
     incoming_start = incoming_line.startSketchPoint.geometry
-    vertex_a = incoming_line.endSketchPoint.geometry
-    vertex_b = outgoing_line.startSketchPoint.geometry
+    incoming_end = incoming_line.endSketchPoint.geometry
+    outgoing_start = outgoing_line.startSketchPoint.geometry
     outgoing_end = outgoing_line.endSketchPoint.geometry
-    vertex_x = (vertex_a.x + vertex_b.x) / 2
-    vertex_y = (vertex_a.y + vertex_b.y) / 2
+
+    incoming_dx = incoming_end.x - incoming_start.x
+    incoming_dy = incoming_end.y - incoming_start.y
+    outgoing_dx = outgoing_end.x - outgoing_start.x
+    outgoing_dy = outgoing_end.y - outgoing_start.y
+    denominator = incoming_dx * outgoing_dy - incoming_dy * outgoing_dx
+    if abs(denominator) <= 1e-9:
+        raise RuntimeError("Cannot place an angle dimension on parallel OpenLOCK segments.")
+
+    between_x = outgoing_start.x - incoming_start.x
+    between_y = outgoing_start.y - incoming_start.y
+    along_incoming = (
+        between_x * outgoing_dy - between_y * outgoing_dx
+    ) / denominator
+    vertex_x = incoming_start.x + along_incoming * incoming_dx
+    vertex_y = incoming_start.y + along_incoming * incoming_dy
 
     incoming_length = math.hypot(incoming_start.x - vertex_x, incoming_start.y - vertex_y)
     outgoing_length = math.hypot(outgoing_end.x - vertex_x, outgoing_end.y - vertex_y)
@@ -392,18 +446,75 @@ def _angle_dimension_text_point(incoming_line, outgoing_line, offset_cm=0.25):
     )
 
 
-def _constrain_profile_shape(sketch, lines, reference_line):
-    """Constrain segment lengths and corner angles while leaving XY translation free."""
+def _radial_dimension_text_point(arc, offset_cm=0.25):
+    center = arc.centerSketchPoint.geometry
+    start = arc.startSketchPoint.geometry
+    end = arc.endSketchPoint.geometry
+    direction_x = (start.x + end.x) / 2 - center.x
+    direction_y = (start.y + end.y) / 2 - center.y
+    direction_length = math.hypot(direction_x, direction_y)
+    if direction_length <= 1e-9:
+        raise RuntimeError("Cannot place a radius dimension on an OpenLOCK fillet.")
+
+    distance = arc.radius + offset_cm
+    return adsk.core.Point3D.create(
+        center.x + direction_x / direction_length * distance,
+        center.y + direction_y / direction_length * distance,
+        0,
+    )
+
+
+def _same_curve(curve_one, curve_two):
+    return curve_one == curve_two
+
+
+def _has_tangent_constraint(geometric_constraints, curve_one, curve_two):
+    tangent_type = adsk.fusion.TangentConstraint.classType()
+    for index in range(geometric_constraints.count):
+        constraint = geometric_constraints.item(index)
+        if constraint.objectType != tangent_type:
+            continue
+        existing_one = constraint.curveOne
+        existing_two = constraint.curveTwo
+        if (
+            _same_curve(existing_one, curve_one)
+            and _same_curve(existing_two, curve_two)
+        ) or (
+            _same_curve(existing_one, curve_two)
+            and _same_curve(existing_two, curve_one)
+        ):
+            return True
+    return False
+
+
+def _add_tangent_constraint(geometric_constraints, curve_one, curve_two):
+    if _has_tangent_constraint(geometric_constraints, curve_one, curve_two):
+        return None
+    constraint = geometric_constraints.addTangent(curve_one, curve_two)
+    if not constraint:
+        raise RuntimeError("Fusion could not add an OpenLOCK fillet tangent constraint.")
+    return constraint
+
+
+def _has_radial_dimension(arc):
+    radial_type = adsk.fusion.SketchRadialDimension.classType()
+    for index in range(arc.sketchDimensions.count):
+        if arc.sketchDimensions.item(index).objectType == radial_type:
+            return True
+    return False
+
+
+def _constrain_profile_shape(sketch, lines, arcs_by_corner, reference_line, points_mm):
+    """Constrain lengths, fillet radii, tangencies, and angles; allow baseline sliding."""
 
     dimensions = sketch.sketchDimensions
     geometric_constraints = sketch.geometricConstraints
     added_constraints = []
 
-    starts = [line.startSketchPoint.geometry for line in lines]
     signed_area = sum(
-        starts[index].x * starts[(index + 1) % len(starts)].y
-        - starts[(index + 1) % len(starts)].x * starts[index].y
-        for index in range(len(starts))
+        points_mm[index][0] * points_mm[(index + 1) % len(points_mm)][1]
+        - points_mm[(index + 1) % len(points_mm)][0] * points_mm[index][1]
+        for index in range(len(points_mm))
     )
     counter_clockwise = signed_area > 0
 
@@ -434,18 +545,58 @@ def _constrain_profile_shape(sketch, lines, reference_line):
                     raise RuntimeError("Fusion could not add an equal-length OpenLOCK constraint.")
                 added_constraints.append(equal_constraint)
 
-        # For an N-sided closed loop, N-3 independent corner angles plus all N
-        # lengths determine the shape up to rigid translation and rotation. The
-        # 13.8 mm edge is then kept collinear with the selected reference line,
-        # leaving translation along that shared line available.
+        # The fillet API may already add a radial dimension. If it did not,
+        # dimension one arc and use equal-radius constraints for the others.
+        dimensioned_arcs = [arc for arc in arcs_by_corner.values() if _has_radial_dimension(arc)]
+        base_arc = dimensioned_arcs[0] if dimensioned_arcs else next(iter(arcs_by_corner.values()))
+        if not _has_radial_dimension(base_arc):
+            dimension_text = _radial_dimension_text_point(base_arc)
+            try:
+                radial_dimension = dimensions.addRadialDimension(base_arc, dimension_text)
+            except Exception:
+                radial_dimension = None
+            if not radial_dimension:
+                radial_dimension = dimensions.addRadialDimension(
+                    base_arc,
+                    dimension_text,
+                    False,
+                )
+            if not radial_dimension:
+                raise RuntimeError("Fusion could not dimension an OpenLOCK fillet radius.")
+            added_constraints.append(radial_dimension)
+
+        for arc in arcs_by_corner.values():
+            if arc == base_arc or _has_radial_dimension(arc):
+                continue
+            equal_constraint = geometric_constraints.addEqual(base_arc, arc)
+            if not equal_constraint:
+                raise RuntimeError("Fusion could not add equal-radius OpenLOCK constraints.")
+            added_constraints.append(equal_constraint)
+
+        for corner_index, arc in arcs_by_corner.items():
+            incoming_line = lines[(corner_index - 1) % len(lines)]
+            outgoing_line = lines[corner_index]
+            for adjacent_line in (incoming_line, outgoing_line):
+                tangent_constraint = _add_tangent_constraint(
+                    geometric_constraints,
+                    arc,
+                    adjacent_line,
+                )
+                if tangent_constraint:
+                    added_constraints.append(tangent_constraint)
+
+        # Keep the independent angles from the original polygon. At a rounded
+        # vertex, the angle is applied to the supporting lines while the arc is
+        # held by its radius and two tangent constraints.
         for vertex_index in range(len(lines) - 3):
             incoming_line = lines[(vertex_index - 1) % len(lines)]
             outgoing_line = lines[vertex_index]
             previous_start = incoming_line.startSketchPoint.geometry
-            vertex = incoming_line.endSketchPoint.geometry
+            incoming_end = incoming_line.endSketchPoint.geometry
+            outgoing_start = outgoing_line.startSketchPoint.geometry
             next_end = outgoing_line.endSketchPoint.geometry
-            ax, ay = previous_start.x - vertex.x, previous_start.y - vertex.y
-            bx, by = next_end.x - vertex.x, next_end.y - vertex.y
+            ax, ay = previous_start.x - incoming_end.x, previous_start.y - incoming_end.y
+            bx, by = next_end.x - outgoing_start.x, next_end.y - outgoing_start.y
             a_length = math.hypot(ax, ay)
             b_length = math.hypot(bx, by)
             cosine = (ax * bx + ay * by) / (a_length * b_length)
@@ -498,7 +649,7 @@ def _point3d_mm(point_mm):
 
 
 def _write_profile_attributes(
-    lines,
+    curves,
     origin_mm,
     rotation_deg,
     flip,
@@ -508,17 +659,17 @@ def _write_profile_attributes(
     offset_mm=0.0,
 ):
     profile_id = uuid.uuid4().hex
-    alignment_line_index = max(
-        range(len(lines)),
+    alignment_curve_index = max(
+        range(len(curves)),
         key=lambda index: math.hypot(
-            lines[index].endSketchPoint.geometry.x
-            - lines[index].startSketchPoint.geometry.x,
-            lines[index].endSketchPoint.geometry.y
-            - lines[index].startSketchPoint.geometry.y,
+            curves[index].endSketchPoint.geometry.x
+            - curves[index].startSketchPoint.geometry.x,
+            curves[index].endSketchPoint.geometry.y
+            - curves[index].startSketchPoint.geometry.y,
         ),
     )
-    for index, line in enumerate(lines):
-        attributes = line.attributes
+    for index, curve in enumerate(curves):
+        attributes = curve.attributes
         attributes.add(ATTRIBUTE_GROUP, "profileId", profile_id)
         attributes.add(ATTRIBUTE_GROUP, "clipType", profile_name)
         attributes.add(ATTRIBUTE_GROUP, "profileVersion", profile_version)
@@ -535,5 +686,5 @@ def _write_profile_attributes(
         attributes.add(
             ATTRIBUTE_GROUP,
             "alignmentLine",
-            "true" if index == alignment_line_index else "false",
+            "true" if index == alignment_curve_index else "false",
         )
