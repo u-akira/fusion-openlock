@@ -261,8 +261,10 @@ def _constrain_openlock_profile(sketch, profile_geometry, profile, reference_lin
     audit = profile["audit_basic_openlock_constraint_plan"]()
     if not audit["valid"]:
         raise RuntimeError(
-            "OpenLOCK constraint plan contains duplicate targets: {}".format(
-                audit["duplicate_targets"]
+            "OpenLOCK constraint plan is invalid: duplicate targets={}, "
+            "priority angle conflicts={}".format(
+                audit["duplicate_targets"],
+                audit["priority_angle_conflicts"],
             )
         )
 
@@ -282,6 +284,14 @@ def _constrain_openlock_profile(sketch, profile_geometry, profile, reference_lin
         alignment_line=profile_geometry["alignment_line"],
         shoulder_inner_point=profile_geometry["shoulder_inner_point"],
         shoulder_inner_width_mm=dimensions["shoulder_inner_half_width"],
+        outer_step_line=profile_geometry["outer_step_line"],
+        outer_step_height_mm=dimensions["outer_step_height"],
+        shoulder_width_line=profile_geometry["shoulder_width_line"],
+        shoulder_width_mm=dimensions["shoulder_width"],
+        outer_step_width_line=profile_geometry["outer_step_width_line"],
+        outer_step_width_mm=dimensions["outer_step_width"],
+        top_edge_length_mm=dimensions["top_edge_length"],
+        fillet_radius_mm=dimensions["center_slot_corner_fillet_radius"],
         bottom_flat_line=profile_geometry["bottom_flat_line"],
         slot_wall_line=profile_geometry["slot_wall_line"],
         slot_half_width_axis=profile_geometry["mirror_line"],
@@ -425,6 +435,11 @@ def _add_closed_profile(sketch, points_mm, fillet_radius_mm, fillet_corner_indic
             )
             if not arc:
                 raise RuntimeError("Fusion could not create an OpenLOCK sketch fillet.")
+            # SketchArcs.addFillet can inherit the construction state of the
+            # trimmed sketch geometry in some Fusion builds. The fillets are
+            # part of the actual closed profile, so force them to normal
+            # sketch geometry explicitly.
+            arc.isConstruction = False
             created_arcs[corner_index] = arc
 
         # The axis is intentionally a construction line. Its endpoints are
@@ -469,6 +484,15 @@ def _add_closed_profile(sketch, points_mm, fillet_radius_mm, fillet_corner_indic
             "shoulder_inner_point": created_lines[
                 constraint_plan["shoulder_inner_point_line_index"]
             ].startSketchPoint,
+            "outer_step_line": created_lines[
+                constraint_plan["outer_step_line_index"]
+            ],
+            "shoulder_width_line": created_lines[
+                constraint_plan["shoulder_width_line_index"]
+            ],
+            "outer_step_width_line": created_lines[
+                constraint_plan["outer_step_width_line_index"]
+            ],
             "symmetry_pairs": symmetry_pairs,
             "independent_lines": [
                 created_lines[index]
@@ -497,8 +521,8 @@ def _add_closed_profile(sketch, points_mm, fillet_radius_mm, fillet_corner_indic
             "slot_wall_line": created_lines[17],
             "slot_ceiling_line": created_lines[16],
             "slope_angle_pair": (
-                created_lines[constraint_plan["angle_pairs"][0][0]],
-                created_lines[constraint_plan["angle_pairs"][0][1]],
+                created_lines[constraint_plan["priority_angle_pair"][0]],
+                created_lines[constraint_plan["priority_angle_pair"][1]],
             ),
         }
     except Exception:
@@ -589,6 +613,42 @@ def _horizontal_dimension_text_point(point_one, point_two, offset_cm=0.45):
     return adsk.core.Point3D.create(
         (first.x + second.x) / 2,
         second.y - offset_cm,
+        0,
+    )
+
+
+def _point_on_line_through_point_parallel_to_line(axis_line, target_point, direction_line):
+    """Return the axis point at the target's profile-height station."""
+
+    axis_start = axis_line.startSketchPoint.geometry
+    axis_end = axis_line.endSketchPoint.geometry
+    target = target_point.geometry
+    direction_start = direction_line.startSketchPoint.geometry
+    direction_end = direction_line.endSketchPoint.geometry
+    point_mm = _PROFILE["point_on_line_through_point_parallel_to_line_mm"](
+        (axis_start.x, axis_start.y),
+        (axis_end.x, axis_end.y),
+        (target.x, target.y),
+        (direction_start.x, direction_start.y),
+        (direction_end.x, direction_end.y),
+    )
+    return adsk.core.Point3D.create(point_mm[0], point_mm[1], 0)
+
+
+def _aligned_dimension_text_point(point_one, point_two, offset_cm=0.45):
+    """Place an aligned dimension label beside a point-to-point datum."""
+
+    first = point_one.geometry
+    second = point_two.geometry
+    dx = second.x - first.x
+    dy = second.y - first.y
+    length = math.hypot(dx, dy)
+    if length <= 1e-9:
+        raise RuntimeError("Cannot place an aligned dimension on coincident points.")
+    normal_x, normal_y = dy / length, -dx / length
+    return adsk.core.Point3D.create(
+        (first.x + second.x) / 2 + normal_x * offset_cm,
+        (first.y + second.y) / 2 + normal_y * offset_cm,
         0,
     )
 
@@ -687,12 +747,17 @@ def _add_tangent_constraint(geometric_constraints, curve_one, curve_two):
     return constraint
 
 
-def _has_radial_dimension(arc):
+def _radial_dimension(arc):
     radial_type = adsk.fusion.SketchRadialDimension.classType()
     for index in range(arc.sketchDimensions.count):
-        if arc.sketchDimensions.item(index).objectType == radial_type:
-            return True
-    return False
+        dimension = arc.sketchDimensions.item(index)
+        if dimension.objectType == radial_type:
+            return dimension
+    return None
+
+
+def _has_radial_dimension(arc):
+    return _radial_dimension(arc) is not None
 
 
 def _set_dimension_expression(dimension, expression):
@@ -721,6 +786,14 @@ def _constrain_profile_shape(
     alignment_line=None,
     bottom_flat_line=None,
     slot_wall_line=None,
+    outer_step_line=None,
+    outer_step_height_mm=None,
+    shoulder_width_line=None,
+    shoulder_width_mm=None,
+    outer_step_width_line=None,
+    outer_step_width_mm=None,
+    top_edge_length_mm=None,
+    fillet_radius_mm=None,
     slot_half_width_axis=None,
     slot_half_width_line=None,
     slot_depth_base_line=None,
@@ -762,6 +835,7 @@ def _constrain_profile_shape(
         for index in range(len(points_mm))
     )
     counter_clockwise = signed_area > 0
+    temporary_points = []
 
     try:
         # Anchor the profile to the selected reference before adding driving
@@ -831,12 +905,32 @@ def _constrain_profile_shape(
             and shoulder_inner_point is not None
             and shoulder_inner_width_mm is not None
         ):
+            shoulder_point_geometry = shoulder_inner_point.geometry
+            shoulder_axis_point = sketch.sketchPoints.add(
+                _point_on_line_through_point_parallel_to_line(
+                    mirror_line,
+                    shoulder_inner_point,
+                    alignment_line,
+                )
+            )
+            if not shoulder_axis_point:
+                raise RuntimeError("Fusion could not create the shoulder datum point.")
+            temporary_points.append(shoulder_axis_point)
+
+            point_on_axis_constraint = geometric_constraints.addCoincident(
+                shoulder_axis_point,
+                mirror_line,
+            )
+            if not point_on_axis_constraint:
+                raise RuntimeError("Fusion could not place the shoulder datum on the centerline.")
+            added_constraints.append(point_on_axis_constraint)
+
             shoulder_dimension = dimensions.addDistanceDimension(
-                mirror_line.startSketchPoint,
+                shoulder_axis_point,
                 shoulder_inner_point,
-                adsk.fusion.DimensionOrientations.HorizontalDimensionOrientation,
-                _horizontal_dimension_text_point(
-                    mirror_line.startSketchPoint,
+                adsk.fusion.DimensionOrientations.AlignedDimensionOrientation,
+                _aligned_dimension_text_point(
+                    shoulder_axis_point,
                     shoulder_inner_point,
                 ),
             )
@@ -950,6 +1044,30 @@ def _constrain_profile_shape(
                     "{:.6f} mm".format(bottom_flat_length_mm),
                 )
 
+            if outer_step_height_mm is not None and base_line is outer_step_line:
+                _set_dimension_expression(
+                    dimension,
+                    "{:.6f} mm".format(outer_step_height_mm),
+                )
+
+            if shoulder_width_mm is not None and base_line is shoulder_width_line:
+                _set_dimension_expression(
+                    dimension,
+                    "{:.6f} mm".format(shoulder_width_mm),
+                )
+
+            if outer_step_width_mm is not None and base_line is outer_step_width_line:
+                _set_dimension_expression(
+                    dimension,
+                    "{:.6f} mm".format(outer_step_width_mm),
+                )
+
+            if top_edge_length_mm is not None and base_line is alignment_line:
+                _set_dimension_expression(
+                    dimension,
+                    "{:.6f} mm".format(top_edge_length_mm),
+                )
+
             for _, matching_line in matching_lines[1:]:
                 equal_constraint = geometric_constraints.addEqual(base_line, matching_line)
                 if not equal_constraint:
@@ -960,7 +1078,8 @@ def _constrain_profile_shape(
         # dimension one arc and use equal-radius constraints for the others.
         dimensioned_arcs = [arc for arc in constrained_arcs if _has_radial_dimension(arc)]
         base_arc = dimensioned_arcs[0] if dimensioned_arcs else constrained_arcs[0]
-        if not _has_radial_dimension(base_arc):
+        radial_dimension = _radial_dimension(base_arc)
+        if radial_dimension is None:
             dimension_text = _radial_dimension_text_point(base_arc)
             try:
                 radial_dimension = dimensions.addRadialDimension(base_arc, dimension_text)
@@ -975,6 +1094,11 @@ def _constrain_profile_shape(
             if not radial_dimension:
                 raise RuntimeError("Fusion could not dimension an OpenLOCK fillet radius.")
             added_constraints.append(radial_dimension)
+        if fillet_radius_mm is not None:
+            _set_dimension_expression(
+                radial_dimension,
+                "{:.6f} mm".format(fillet_radius_mm),
+            )
 
         for arc in constrained_arcs:
             if arc == base_arc or _has_radial_dimension(arc):
@@ -1006,6 +1130,11 @@ def _constrain_profile_shape(
         # held by its radius and two tangent constraints. Mirrored angles are
         # implied by the symmetry constraints and are deliberately omitted.
         for incoming_line, outgoing_line in angle_pairs:
+            is_required_slope_angle = (
+                slope_angle_pair is not None
+                and incoming_line is slope_angle_pair[0]
+                and outgoing_line is slope_angle_pair[1]
+            )
             previous_start = incoming_line.startSketchPoint.geometry
             incoming_end = incoming_line.endSketchPoint.geometry
             outgoing_start = outgoing_line.startSketchPoint.geometry
@@ -1030,6 +1159,10 @@ def _constrain_profile_shape(
                         else None
                     )
                 except Exception:
+                    if is_required_slope_angle:
+                        raise RuntimeError(
+                            "Fusion could not add the required 135 degree OpenLOCK angle."
+                        )
                     angle_constraint = None
             else:
                 try:
@@ -1038,17 +1171,25 @@ def _constrain_profile_shape(
                         outgoing_line,
                         _angle_dimension_text_point(incoming_line, outgoing_line),
                     )
-                except Exception:
+                except Exception as error:
                     # An angle can already be implied by the symmetry and
                     # direction constraints. Fusion rejects that redundant
-                    # dimension as over-constrained; keep the existing relation.
+                    # dimension as over-constrained; keep the existing relation
+                    # for optional angles only. The 135 degree slope is a
+                    # required design dimension and must not silently degrade
+                    # to a nearby solved value such as 135.1 degrees.
+                    if is_required_slope_angle:
+                        raise RuntimeError(
+                            "Fusion could not add the required 135 degree OpenLOCK angle."
+                        ) from error
                     angle_constraint = None
             if not angle_constraint:
+                if is_required_slope_angle:
+                    raise RuntimeError(
+                        "Fusion did not create the required 135 degree OpenLOCK angle."
+                    )
                 continue
-            if slope_angle_deg is not None and slope_angle_pair is not None and (
-                incoming_line is slope_angle_pair[0]
-                and outgoing_line is slope_angle_pair[1]
-            ):
+            if is_required_slope_angle and slope_angle_deg is not None:
                 _set_dimension_expression(
                     angle_constraint,
                     "{:.6f} deg".format(slope_angle_deg),
@@ -1061,6 +1202,12 @@ def _constrain_profile_shape(
             try:
                 if constraint.isValid and constraint.isDeletable:
                     constraint.deleteMe()
+            except Exception:
+                pass
+        for point in reversed(temporary_points):
+            try:
+                if point.isValid and point.isDeletable:
+                    point.deleteMe()
             except Exception:
                 pass
         raise

@@ -7,9 +7,11 @@ from math import atan2, degrees
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "OpenLOCKHole")))
 
 from openlock_profile import (
+    BASIC_OPENLOCK_DIMENSIONS_MM,
     audit_basic_openlock_constraint_plan,
     basic_openlock_constraint_plan,
     basic_openlock_profile_mm,
+    point_on_line_through_point_parallel_to_line_mm,
     profile_bounds_mm,
     transform_profile_mm,
     transform_profile_to_reference_mm,
@@ -77,6 +79,7 @@ class OpenLockProfileTests(unittest.TestCase):
         self.assertAlmostEqual(9.8 - 4.3, 5.5)
         self.assertAlmostEqual(9.8 - 7.8, 2.0)
         self.assertAlmostEqual(7.2 - 0.0, 7.2)
+        self.assertAlmostEqual(135.0, BASIC_OPENLOCK_DIMENSIONS_MM["slope_angle"])
         self.assertAlmostEqual(
             135.0,
             180.0 - degrees(atan2(2.0, 5.76 - 3.77)),
@@ -96,6 +99,9 @@ class OpenLockProfileTests(unittest.TestCase):
         self.assertIn((15, 17), plan["symmetry_line_pairs"])
         self.assertEqual(plan["centered_line_indices"], (7, 16))
         self.assertIn(7, plan["independent_line_indices"])
+        # The lower diagonal length must remain solver-driven so the required
+        # 135 degree angle is not made redundant by another driving target.
+        self.assertNotIn(1, plan["independent_line_indices"])
         self.assertNotIn(2, plan["independent_line_indices"])
         self.assertNotIn(17, plan["independent_line_indices"])
         self.assertNotIn(16, plan["independent_line_indices"])
@@ -103,12 +109,18 @@ class OpenLockProfileTests(unittest.TestCase):
         self.assertNotIn(8, plan["independent_line_indices"])
         self.assertEqual(plan["angle_pairs"], ((0, 1), (3, 4)))
         self.assertEqual(plan["shoulder_inner_point_line_index"], 4)
+        self.assertEqual(plan["outer_step_line_index"], 6)
+        self.assertEqual(plan["shoulder_width_line_index"], 3)
+        self.assertEqual(plan["outer_step_width_line_index"], 5)
+        self.assertEqual(plan["priority_angle_pair"], (0, 1))
+        self.assertEqual(plan["priority_angle_pair"], plan["angle_pairs"][0])
 
     def test_constraint_plan_has_no_duplicate_targets(self):
         audit = audit_basic_openlock_constraint_plan()
 
         self.assertTrue(audit["valid"])
         self.assertEqual(audit["duplicate_targets"], ())
+        self.assertEqual(audit["priority_angle_conflicts"], ())
         self.assertEqual(
             len(audit["dimension_targets"]),
             len(set(audit["dimension_targets"])),
@@ -117,6 +129,22 @@ class OpenLockProfileTests(unittest.TestCase):
             len(audit["relation_targets"]),
             len(set(audit["relation_targets"])),
         )
+
+    def test_shoulder_datum_supports_horizontal_reference(self):
+        point = point_on_line_through_point_parallel_to_line_mm(
+            (0.0, -5.0), (0.0, 5.0), (4.76, 2.0), (0.0, 0.0), (10.0, 0.0)
+        )
+
+        self.assertAlmostEqual(point[0], 0.0)
+        self.assertAlmostEqual(point[1], 2.0)
+
+    def test_shoulder_datum_supports_vertical_reference(self):
+        point = point_on_line_through_point_parallel_to_line_mm(
+            (-5.0, 0.0), (5.0, 0.0), (2.0, 4.76), (0.0, 0.0), (0.0, 10.0)
+        )
+
+        self.assertAlmostEqual(point[0], 2.0)
+        self.assertAlmostEqual(point[1], 0.0)
 
     def test_rotation_90_degrees(self):
         transformed = transform_profile_mm([(1.0, 0.0)], rotation_deg=90.0)

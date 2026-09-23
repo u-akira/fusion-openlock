@@ -18,6 +18,7 @@ PROFILE_NAME = "Basic OpenLOCK"
 BASIC_OPENLOCK_DIMENSIONS_MM = {
     "overall_height": 9.80,
     "outer_half_width": 6.90,
+    "top_edge_length": 13.80,
     "outer_step_height": 2.00,
     "outer_step_width": 1.00,
     "height_from_top_to_shoulder": 5.50,
@@ -60,11 +61,18 @@ def basic_openlock_constraint_plan():
         # Line 2 is the 2.30 mm vertical shoulder segment. Its length is
         # intentionally left solver-driven; the shoulder position is driven
         # by the 4.76 mm horizontal datum below instead.
+        # Line 1 is the lower diagonal. Its length must remain solver-driven
+        # so the required 135 degree corner and 4.76 mm shoulder datum take
+        # priority instead of competing with a second driving target.
         # Line 17 is the slot wall. Both ends are filleted, so its visible
         # segment is 6.20 mm even though the slot depth is 7.20 mm. The depth
         # is driven by the offset between the bottom and ceiling instead.
-        "independent_line_indices": (0, 1, 3, 4, 5, 6, 7),
+        "independent_line_indices": (0, 3, 4, 5, 6, 7),
         "shoulder_inner_point_line_index": 4,
+        "outer_step_line_index": 6,
+        "shoulder_width_line_index": 3,
+        "outer_step_width_line_index": 5,
+        "priority_angle_pair": (0, 1),
         "angle_pairs": ((0, 1), (3, 4)),
         "parallel_line_indices": (0, 3, 5, 16),
         "perpendicular_line_indices": (2, 6, 17),
@@ -117,6 +125,16 @@ def audit_basic_openlock_constraint_plan():
         for pair in plan["angle_pairs"]
     )
 
+    priority_angle_conflicts = []
+    priority_angle_pair = plan["priority_angle_pair"]
+    # Line 0 may retain its bottom-flat dimension, but line 1 must not have
+    # its own driving length dimension: the 135 degree angle is the priority
+    # driver for this corner.
+    if priority_angle_pair[1] in plan["independent_line_indices"]:
+        priority_angle_conflicts.append(
+            ("required_angle", ("line", priority_angle_pair[1]))
+        )
+
     duplicate_targets = []
     for category, targets in (
         ("dimension", dimension_targets),
@@ -129,11 +147,41 @@ def audit_basic_openlock_constraint_plan():
             seen.add(target)
 
     return {
-        "valid": not duplicate_targets,
+        "valid": not duplicate_targets and not priority_angle_conflicts,
         "duplicate_targets": tuple(duplicate_targets),
+        "priority_angle_conflicts": tuple(priority_angle_conflicts),
         "dimension_targets": tuple(dimension_targets),
         "relation_targets": tuple(relation_targets),
     }
+
+
+def point_on_line_through_point_parallel_to_line_mm(
+    axis_start_mm,
+    axis_end_mm,
+    target_point_mm,
+    direction_start_mm,
+    direction_end_mm,
+):
+    """Find the axis point on a line through the target parallel to a datum."""
+
+    axis_x, axis_y = axis_start_mm
+    axis_dx = axis_end_mm[0] - axis_x
+    axis_dy = axis_end_mm[1] - axis_y
+    direction_dx = direction_end_mm[0] - direction_start_mm[0]
+    direction_dy = direction_end_mm[1] - direction_start_mm[1]
+    denominator = axis_dx * direction_dy - axis_dy * direction_dx
+    if abs(denominator) <= 1e-9:
+        raise ValueError("The axis and datum direction must not be parallel.")
+
+    target_dx = target_point_mm[0] - axis_x
+    target_dy = target_point_mm[1] - axis_y
+    axis_parameter = (
+        target_dx * direction_dy - target_dy * direction_dx
+    ) / denominator
+    return (
+        axis_x + axis_parameter * axis_dx,
+        axis_y + axis_parameter * axis_dy,
+    )
 
 
 def basic_openlock_profile_mm():
