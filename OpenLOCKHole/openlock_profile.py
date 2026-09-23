@@ -36,6 +36,106 @@ BASIC_OPENLOCK_DIMENSIONS_MM = {
 BASIC_OPENLOCK_FILLET_CORNER_INDICES = (0, 15, 16, 17)
 
 
+def basic_openlock_constraint_plan():
+    """Return the stable sketch-constraint topology for the basic profile.
+
+    The plan deliberately keeps the original full top edge and slot ceiling
+    as single lines. Fusion applies symmetry to corresponding entities rather
+    than creating a half-length mirror layout, so existing dimensions remain
+    attached to the same geometric targets.
+    """
+
+    return {
+        "symmetry_line_pairs": (
+            (0, 14),
+            (1, 13),
+            (2, 12),
+            (3, 11),
+            (4, 10),
+            (5, 9),
+            (6, 8),
+            (15, 17),
+        ),
+        "centered_line_indices": (7, 16),
+        # Line 2 is the 2.30 mm vertical shoulder segment. Its length is
+        # intentionally left solver-driven; the shoulder position is driven
+        # by the 4.76 mm horizontal datum below instead.
+        # Line 17 is the slot wall. Both ends are filleted, so its visible
+        # segment is 6.20 mm even though the slot depth is 7.20 mm. The depth
+        # is driven by the offset between the bottom and ceiling instead.
+        "independent_line_indices": (0, 1, 3, 4, 5, 6, 7),
+        "shoulder_inner_point_line_index": 4,
+        "angle_pairs": ((0, 1), (3, 4)),
+        "parallel_line_indices": (0, 3, 5, 16),
+        "perpendicular_line_indices": (2, 6, 17),
+    }
+
+
+def audit_basic_openlock_constraint_plan():
+    """Check the planned dimension and relation targets for duplicates.
+
+    This is a solver-independent audit. It cannot reproduce Fusion's VCS
+    solver, but it catches duplicate target registrations before geometry is
+    created, such as assigning two length dimensions to the same line or
+    registering the same relation pair twice.
+    """
+
+    plan = basic_openlock_constraint_plan()
+    dimension_targets = [
+        ("segment_length", ("line", index))
+        for index in plan["independent_line_indices"]
+    ]
+    dimension_targets.extend(
+        [
+            ("shoulder_inner_half_width", ("axis", "point", 4)),
+            ("slot_half_width", ("axis", "line", 17)),
+            ("slot_depth", ("line_pair", 0, 16)),
+            ("overall_height", ("line_pair", 0, 7)),
+            ("fillet_radius", ("arc", 0)),
+        ]
+    )
+
+    relation_targets = []
+    relation_targets.extend(
+        ("symmetry", tuple(sorted(pair)))
+        for pair in plan["symmetry_line_pairs"]
+    )
+    relation_targets.extend(
+        ("centered", (index, "mirror_axis"))
+        for index in plan["centered_line_indices"]
+    )
+    relation_targets.extend(
+        ("parallel", tuple(sorted((index, 7))))
+        for index in plan["parallel_line_indices"]
+    )
+    relation_targets.extend(
+        ("perpendicular", tuple(sorted((index, 7))))
+        for index in plan["perpendicular_line_indices"]
+    )
+    relation_targets.extend(
+        ("angle", tuple(pair))
+        for pair in plan["angle_pairs"]
+    )
+
+    duplicate_targets = []
+    for category, targets in (
+        ("dimension", dimension_targets),
+        ("relation", relation_targets),
+    ):
+        seen = set()
+        for target in targets:
+            if target in seen:
+                duplicate_targets.append((category, target))
+            seen.add(target)
+
+    return {
+        "valid": not duplicate_targets,
+        "duplicate_targets": tuple(duplicate_targets),
+        "dimension_targets": tuple(dimension_targets),
+        "relation_targets": tuple(relation_targets),
+    }
+
+
 def basic_openlock_profile_mm():
     """Return the nominal sharp-corner Basic OpenLOCK outline in mm.
 

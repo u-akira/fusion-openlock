@@ -218,22 +218,22 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
                 _reference_profile_placement(sketch, inputs)
             )
 
-            created_lines, created_arcs = _add_closed_profile(
+            profile_geometry = _add_closed_profile(
                 sketch,
                 points_mm,
                 profile["BASIC_OPENLOCK_DIMENSIONS_MM"]["center_slot_corner_fillet_radius"],
                 profile["BASIC_OPENLOCK_FILLET_CORNER_INDICES"],
             )
             try:
-                _constrain_profile_shape(
+                _constrain_openlock_profile(
                     sketch,
-                    created_lines,
-                    created_arcs,
+                    profile_geometry,
+                    profile,
                     reference_line,
                     points_mm,
                 )
                 _write_profile_attributes(
-                    created_lines + list(created_arcs.values()),
+                    profile_geometry["lines"] + list(profile_geometry["arcs"].values()),
                     origin_mm,
                     rotation_deg,
                     flip,
@@ -243,12 +243,63 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
                     offset_mm=offset_mm,
                 )
             except Exception:
-                _delete_profile_geometry(created_lines, created_arcs)
+                _delete_profile_geometry(
+                    profile_geometry["lines"],
+                    profile_geometry["arcs"],
+                    profile_geometry["mirror_line"],
+                )
                 raise
 
         except Exception:
             if _ui:
                 _ui.messageBox("Could not create OpenLOCK sketch:\n{}".format(traceback.format_exc()))
+
+
+def _constrain_openlock_profile(sketch, profile_geometry, profile, reference_line, points_mm):
+    """Apply the same constraint plan during Execute and command Preview."""
+
+    audit = profile["audit_basic_openlock_constraint_plan"]()
+    if not audit["valid"]:
+        raise RuntimeError(
+            "OpenLOCK constraint plan contains duplicate targets: {}".format(
+                audit["duplicate_targets"]
+            )
+        )
+
+    dimensions = profile["BASIC_OPENLOCK_DIMENSIONS_MM"]
+    _constrain_profile_shape(
+        sketch,
+        profile_geometry["lines"],
+        profile_geometry["arcs"],
+        reference_line,
+        points_mm,
+        source_lines=profile_geometry["independent_lines"],
+        source_arc_constraints=profile_geometry["independent_arc_constraints"],
+        source_angle_pairs=profile_geometry["angle_pairs"],
+        symmetry_pairs=profile_geometry["symmetry_pairs"],
+        direction_constraints=profile_geometry["direction_constraints"],
+        mirror_line=profile_geometry["mirror_line"],
+        alignment_line=profile_geometry["alignment_line"],
+        shoulder_inner_point=profile_geometry["shoulder_inner_point"],
+        shoulder_inner_width_mm=dimensions["shoulder_inner_half_width"],
+        bottom_flat_line=profile_geometry["bottom_flat_line"],
+        slot_wall_line=profile_geometry["slot_wall_line"],
+        slot_half_width_axis=profile_geometry["mirror_line"],
+        slot_half_width_line=profile_geometry["slot_wall_line"],
+        slot_depth_base_line=profile_geometry["bottom_flat_line"],
+        slot_depth_ceiling_line=profile_geometry["slot_ceiling_line"],
+        slope_angle_pair=profile_geometry["slope_angle_pair"],
+        overall_height_mm=dimensions["overall_height"],
+        # 2.97 mm is measured between the sharp, pre-fillet corners. The
+        # visible line loses one R0.50 trim length.
+        bottom_flat_length_mm=(
+            dimensions["bottom_flat_from_slot_wall"]
+            - dimensions["center_slot_corner_fillet_radius"]
+        ),
+        slot_depth_mm=dimensions["center_slot_depth_from_bottom"],
+        slot_half_width_mm=dimensions["center_slot_half_width"],
+        slope_angle_deg=dimensions["slope_angle"],
+    )
 
 
 class PreviewHandler(adsk.core.CommandEventHandler):
@@ -270,7 +321,10 @@ class PreviewHandler(adsk.core.CommandEventHandler):
                 args.isValidResult = False
                 return
 
-            profile, points_mm, _, _, _, _, _ = _reference_profile_placement(sketch, inputs)
+            profile, points_mm, _, _, _, _, _ = _reference_profile_placement(
+                sketch,
+                inputs,
+            )
             _add_closed_profile(
                 sketch,
                 points_mm,
@@ -323,9 +377,20 @@ def _sketch_line_endpoints_mm(line):
 
 
 def _add_closed_profile(sketch, points_mm, fillet_radius_mm, fillet_corner_indices):
-    lines = sketch.sketchCurves.sketchLines
+    """Create the original full outline and prepare symmetry constraints.
+
+    Keeping the original 18-line topology is important: it preserves the
+    existing dimension targets (including the single 13.8 mm top edge). The
+    left and right entities remain separate sketch entities, but Fusion's
+    symmetry constraints keep the left side driven by the right side without
+    splitting dimensioned edges into half-length segments.
+    """
+
+    sketch_lines = sketch.sketchCurves.sketchLines
+    sketch_arcs = sketch.sketchCurves.sketchArcs
     created_lines = []
     created_arcs = {}
+    mirror_line = None
     first_line = None
     previous_end = None
 
@@ -334,8 +399,12 @@ def _add_closed_profile(sketch, points_mm, fillet_radius_mm, fillet_corner_indic
             start_mm = points_mm[index]
             end_mm = points_mm[(index + 1) % len(points_mm)]
             start = previous_end or _point3d_mm(start_mm)
-            end = first_line.startSketchPoint if index == len(points_mm) - 1 else _point3d_mm(end_mm)
-            line = lines.addByTwoPoints(start, end)
+            end = (
+                first_line.startSketchPoint
+                if index == len(points_mm) - 1
+                else _point3d_mm(end_mm)
+            )
+            line = sketch_lines.addByTwoPoints(start, end)
             if not line:
                 raise RuntimeError("Fusion could not create a profile segment.")
             created_lines.append(line)
@@ -343,12 +412,11 @@ def _add_closed_profile(sketch, points_mm, fillet_radius_mm, fillet_corner_indic
                 first_line = line
             previous_end = line.endSketchPoint
 
-        arcs = sketch.sketchCurves.sketchArcs
         radius_cm = fillet_radius_mm * MM_TO_CM
         for corner_index in fillet_corner_indices:
             incoming_line = created_lines[(corner_index - 1) % len(created_lines)]
             outgoing_line = created_lines[corner_index]
-            arc = arcs.addFillet(
+            arc = sketch_arcs.addFillet(
                 incoming_line,
                 incoming_line.endSketchPoint.geometry,
                 outgoing_line,
@@ -358,22 +426,108 @@ def _add_closed_profile(sketch, points_mm, fillet_radius_mm, fillet_corner_indic
             if not arc:
                 raise RuntimeError("Fusion could not create an OpenLOCK sketch fillet.")
             created_arcs[corner_index] = arc
+
+        # The axis is intentionally a construction line. Its endpoints are
+        # placed at the centers of the top edge and slot ceiling so the axis
+        # follows the profile when the symmetry constraints solve.
+        top_center_mm = _midpoint_mm(points_mm[7], points_mm[8])
+        slot_center_mm = _midpoint_mm(points_mm[16], points_mm[17])
+        mirror_line = sketch_lines.addByTwoPoints(
+            _point3d_mm(top_center_mm),
+            _point3d_mm(slot_center_mm),
+        )
+        if not mirror_line:
+            raise RuntimeError("Fusion could not create the OpenLOCK centerline.")
+        mirror_line.isConstruction = True
+
+        # Pair corresponding entities across the axis. The top edge and slot
+        # ceiling are each a single centered line, so their endpoints are
+        # paired instead of pairing the lines with themselves.
+        constraint_plan = _PROFILE["basic_openlock_constraint_plan"]()
+        symmetry_pairs = [
+            (created_lines[right], created_lines[left])
+            for right, left in constraint_plan["symmetry_line_pairs"]
+        ]
+        symmetry_pairs.extend(
+            [
+                (created_lines[index].startSketchPoint, created_lines[index].endSketchPoint)
+                for index in constraint_plan["centered_line_indices"]
+            ]
+        )
+        symmetry_pairs.extend(
+            [
+                (created_arcs[0], created_arcs[15]),
+                (created_arcs[17], created_arcs[16]),
+            ]
+        )
+
+        return {
+            "lines": created_lines,
+            "arcs": created_arcs,
+            "mirror_line": mirror_line,
+            "alignment_line": created_lines[7],
+            "shoulder_inner_point": created_lines[
+                constraint_plan["shoulder_inner_point_line_index"]
+            ].startSketchPoint,
+            "symmetry_pairs": symmetry_pairs,
+            "independent_lines": [
+                created_lines[index]
+                for index in constraint_plan["independent_line_indices"]
+            ],
+            "independent_arc_constraints": [
+                (created_arcs[0], created_lines[17], created_lines[0]),
+                (created_arcs[17], created_lines[16], created_lines[17]),
+            ],
+            "angle_pairs": [
+                (created_lines[incoming], created_lines[outgoing])
+                for incoming, outgoing in constraint_plan["angle_pairs"]
+            ],
+            "direction_constraints": {
+                "parallel": [
+                    (created_lines[index], created_lines[7])
+                    for index in constraint_plan["parallel_line_indices"]
+                ],
+                "perpendicular": [
+                    (created_lines[index], created_lines[7])
+                    for index in constraint_plan["perpendicular_line_indices"]
+                ],
+                "axis_perpendicular": (mirror_line, created_lines[7]),
+            },
+            "bottom_flat_line": created_lines[0],
+            "slot_wall_line": created_lines[17],
+            "slot_ceiling_line": created_lines[16],
+            "slope_angle_pair": (
+                created_lines[constraint_plan["angle_pairs"][0][0]],
+                created_lines[constraint_plan["angle_pairs"][0][1]],
+            ),
+        }
     except Exception:
-        _delete_profile_geometry(created_lines, created_arcs)
+        _delete_profile_geometry(
+            created_lines,
+            created_arcs,
+            mirror_line,
+        )
         raise
 
-    return created_lines, created_arcs
 
-
-def _delete_profile_geometry(lines, arcs_by_corner):
+def _delete_profile_geometry(lines, arcs_by_corner, mirror_line=None):
     """Delete added arcs before their trimmed profile lines."""
 
     for arc in reversed(list(arcs_by_corner.values())):
-        if arc.isValid and arc.isDeletable:
+        if arc and arc.isValid and arc.isDeletable:
             arc.deleteMe()
     for line in reversed(lines):
         if line.isValid and line.isDeletable:
             line.deleteMe()
+    if mirror_line and mirror_line.isValid and mirror_line.isDeletable:
+        mirror_line.deleteMe()
+
+
+def _midpoint_mm(point_one, point_two):
+    return (
+        (point_one[0] + point_two[0]) / 2,
+        (point_one[1] + point_two[1]) / 2,
+    )
 
 
 def _line_length_cm(line):
@@ -398,6 +552,43 @@ def _dimension_text_point(line, counter_clockwise, offset_cm=0.45):
     return adsk.core.Point3D.create(
         (start.x + end.x) / 2 + normal_x * offset_cm,
         (start.y + end.y) / 2 + normal_y * offset_cm,
+        0,
+    )
+
+
+def _offset_dimension_text_point(line_one, line_two, offset_cm=0.45):
+    """Place an offset dimension label between two parallel sketch lines."""
+
+    first_start = line_one.startSketchPoint.geometry
+    first_end = line_one.endSketchPoint.geometry
+    second_start = line_two.startSketchPoint.geometry
+    second_end = line_two.endSketchPoint.geometry
+    first_mid_x = (first_start.x + first_end.x) / 2
+    first_mid_y = (first_start.y + first_end.y) / 2
+    second_mid_x = (second_start.x + second_end.x) / 2
+    second_mid_y = (second_start.y + second_end.y) / 2
+    dx = first_end.x - first_start.x
+    dy = first_end.y - first_start.y
+    length = math.hypot(dx, dy)
+    if length <= 1e-9:
+        raise RuntimeError("Cannot place an offset dimension on a zero-length line.")
+
+    normal_x, normal_y = dy / length, -dx / length
+    return adsk.core.Point3D.create(
+        (first_mid_x + second_mid_x) / 2 + normal_x * offset_cm,
+        (first_mid_y + second_mid_y) / 2 + normal_y * offset_cm,
+        0,
+    )
+
+
+def _horizontal_dimension_text_point(point_one, point_two, offset_cm=0.45):
+    """Place a horizontal point-to-point dimension below the target point."""
+
+    first = point_one.geometry
+    second = point_two.geometry
+    return adsk.core.Point3D.create(
+        (first.x + second.x) / 2,
+        second.y - offset_cm,
         0,
     )
 
@@ -504,12 +695,66 @@ def _has_radial_dimension(arc):
     return False
 
 
-def _constrain_profile_shape(sketch, lines, arcs_by_corner, reference_line, points_mm):
-    """Constrain lengths, fillet radii, tangencies, and angles; allow baseline sliding."""
+def _set_dimension_expression(dimension, expression):
+    """Set a driving sketch dimension using a unit-qualified Fusion expression."""
+
+    parameter = dimension.parameter
+    if not parameter:
+        raise RuntimeError("Fusion did not expose a parameter for an OpenLOCK dimension.")
+    parameter.expression = expression
+
+
+def _constrain_profile_shape(
+    sketch,
+    lines,
+    arcs_by_corner,
+    reference_line,
+    points_mm,
+    source_lines=None,
+    source_arc_constraints=None,
+    source_angle_pairs=None,
+    symmetry_pairs=None,
+    direction_constraints=None,
+    mirror_line=None,
+    shoulder_inner_point=None,
+    shoulder_inner_width_mm=None,
+    alignment_line=None,
+    bottom_flat_line=None,
+    slot_wall_line=None,
+    slot_half_width_axis=None,
+    slot_half_width_line=None,
+    slot_depth_base_line=None,
+    slot_depth_ceiling_line=None,
+    slope_angle_pair=None,
+    overall_height_mm=None,
+    bottom_flat_length_mm=None,
+    slot_depth_mm=None,
+    slot_half_width_mm=None,
+    slope_angle_deg=None,
+):
+    """Constrain independent right-side geometry; the left side follows by symmetry."""
 
     dimensions = sketch.sketchDimensions
     geometric_constraints = sketch.geometricConstraints
     added_constraints = []
+    dimension_lines = source_lines or lines
+    arc_constraints = source_arc_constraints
+    if arc_constraints is None:
+        arc_constraints = [
+            (
+                arc,
+                lines[(corner_index - 1) % len(lines)],
+                lines[corner_index],
+            )
+            for corner_index, arc in arcs_by_corner.items()
+        ]
+    constrained_arcs = [item[0] for item in arc_constraints]
+    angle_pairs = source_angle_pairs
+    if angle_pairs is None:
+        angle_pairs = [
+            (lines[(vertex_index - 1) % len(lines)], lines[vertex_index])
+            for vertex_index in range(len(lines) - 3)
+        ]
 
     signed_area = sum(
         points_mm[index][0] * points_mm[(index + 1) % len(points_mm)][1]
@@ -519,16 +764,173 @@ def _constrain_profile_shape(sketch, lines, arcs_by_corner, reference_line, poin
     counter_clockwise = signed_area > 0
 
     try:
-        # A driving length for each unique segment size plus Equal constraints
-        # for matching segments keeps the outline exact without dimensioning
-        # both mirrored sides independently.
+        # Anchor the profile to the selected reference before adding driving
+        # dimensions. Adding this after the dimensions lets the solver move
+        # the top edge away from the selected reference line.
+        alignment_line = alignment_line or max(dimension_lines, key=_line_length_cm)
+        collinear_constraint = geometric_constraints.addCollinear(
+            alignment_line,
+            reference_line,
+        )
+        if not collinear_constraint:
+            raise RuntimeError(
+                "Fusion could not align the OpenLOCK profile edge to the reference line."
+            )
+        added_constraints.append(collinear_constraint)
+
+        if symmetry_pairs:
+            for entity_one, entity_two in symmetry_pairs:
+                symmetry_constraint = geometric_constraints.addSymmetry(
+                    entity_one,
+                    entity_two,
+                    mirror_line,
+                )
+                if not symmetry_constraint:
+                    raise RuntimeError(
+                        "Fusion could not add an OpenLOCK symmetry constraint."
+                    )
+                added_constraints.append(symmetry_constraint)
+
+        if direction_constraints:
+            parallel_method = getattr(geometric_constraints, "addParallel", None)
+            if parallel_method:
+                for line_one, line_two in direction_constraints.get("parallel", []):
+                    try:
+                        parallel_constraint = parallel_method(line_one, line_two)
+                    except Exception:
+                        # The line may already be parallel through a symmetry,
+                        # perpendicular, or angular constraint. Fusion reports
+                        # that redundant optional constraint as over-constrained;
+                        # keep the stronger existing constraint instead.
+                        parallel_constraint = None
+                    if parallel_constraint:
+                        added_constraints.append(parallel_constraint)
+
+            perpendicular_method = getattr(geometric_constraints, "addPerpendicular", None)
+            if not perpendicular_method:
+                perpendicular_method = getattr(
+                    geometric_constraints,
+                    "addPerpendicular2",
+                    None,
+                )
+            if perpendicular_method:
+                perpendicular_pairs = list(direction_constraints.get("perpendicular", []))
+                axis_pair = direction_constraints.get("axis_perpendicular")
+                if axis_pair:
+                    perpendicular_pairs.append(axis_pair)
+                for line_one, line_two in perpendicular_pairs:
+                    try:
+                        perpendicular_constraint = perpendicular_method(line_one, line_two)
+                    except Exception:
+                        perpendicular_constraint = None
+                    if perpendicular_constraint:
+                        added_constraints.append(perpendicular_constraint)
+
+        if (
+            mirror_line is not None
+            and shoulder_inner_point is not None
+            and shoulder_inner_width_mm is not None
+        ):
+            shoulder_dimension = dimensions.addDistanceDimension(
+                mirror_line.startSketchPoint,
+                shoulder_inner_point,
+                adsk.fusion.DimensionOrientations.HorizontalDimensionOrientation,
+                _horizontal_dimension_text_point(
+                    mirror_line.startSketchPoint,
+                    shoulder_inner_point,
+                ),
+            )
+            if not shoulder_dimension:
+                raise RuntimeError(
+                    "Fusion could not dimension the OpenLOCK shoulder datum."
+                )
+            _set_dimension_expression(
+                shoulder_dimension,
+                "{:.6f} mm".format(shoulder_inner_width_mm),
+            )
+            added_constraints.append(shoulder_dimension)
+
+        if (
+            slot_half_width_axis is not None
+            and slot_half_width_line is not None
+            and slot_half_width_mm is not None
+        ):
+            try:
+                slot_width_dimension = dimensions.addOffsetDimension(
+                    slot_half_width_axis,
+                    slot_half_width_line,
+                    _offset_dimension_text_point(
+                        slot_half_width_axis,
+                        slot_half_width_line,
+                    ),
+                )
+            except Exception:
+                slot_width_dimension = None
+            if not slot_width_dimension:
+                raise RuntimeError("Fusion could not dimension the OpenLOCK slot half-width.")
+            _set_dimension_expression(
+                slot_width_dimension,
+                "{:.6f} mm".format(slot_half_width_mm),
+            )
+            added_constraints.append(slot_width_dimension)
+
+        if (
+            slot_depth_base_line is not None
+            and slot_depth_ceiling_line is not None
+            and slot_depth_mm is not None
+        ):
+            try:
+                slot_depth_dimension = dimensions.addOffsetDimension(
+                    slot_depth_base_line,
+                    slot_depth_ceiling_line,
+                    _offset_dimension_text_point(
+                        slot_depth_base_line,
+                        slot_depth_ceiling_line,
+                    ),
+                )
+            except Exception:
+                slot_depth_dimension = None
+            if not slot_depth_dimension:
+                raise RuntimeError("Fusion could not dimension the OpenLOCK slot depth.")
+            _set_dimension_expression(
+                slot_depth_dimension,
+                "{:.6f} mm".format(slot_depth_mm),
+            )
+            added_constraints.append(slot_depth_dimension)
+
+        if (
+            bottom_flat_line is not None
+            and alignment_line is not None
+            and overall_height_mm is not None
+        ):
+            overall_height_dimension = dimensions.addOffsetDimension(
+                bottom_flat_line,
+                alignment_line,
+                _offset_dimension_text_point(
+                    bottom_flat_line,
+                    alignment_line,
+                ),
+            )
+            if not overall_height_dimension:
+                raise RuntimeError(
+                    "Fusion could not dimension the OpenLOCK overall height."
+                )
+            _set_dimension_expression(
+                overall_height_dimension,
+                "{:.6f} mm".format(overall_height_mm),
+            )
+            added_constraints.append(overall_height_dimension)
+
+        # A driving length for each unique independent segment plus Equal
+        # constraints for matching independent segments keeps the right side
+        # exact. The left side is driven by the symmetry constraints above.
         length_groups = {}
-        for line in lines:
+        for line_index, line in enumerate(dimension_lines):
             length_key = round(_line_length_cm(line), 8)
-            length_groups.setdefault(length_key, []).append(line)
+            length_groups.setdefault(length_key, []).append((line_index, line))
 
         for matching_lines in length_groups.values():
-            base_line = matching_lines[0]
+            base_line_index, base_line = matching_lines[0]
             dimension = dimensions.addDistanceDimension(
                 base_line.startSketchPoint,
                 base_line.endSketchPoint,
@@ -539,7 +941,16 @@ def _constrain_profile_shape(sketch, lines, arcs_by_corner, reference_line, poin
                 raise RuntimeError("Fusion could not add an OpenLOCK segment length constraint.")
             added_constraints.append(dimension)
 
-            for matching_line in matching_lines[1:]:
+            if bottom_flat_length_mm is not None and (
+                base_line is bottom_flat_line
+                or (bottom_flat_line is None and base_line_index in {0, len(lines) - 4})
+            ):
+                _set_dimension_expression(
+                    dimension,
+                    "{:.6f} mm".format(bottom_flat_length_mm),
+                )
+
+            for _, matching_line in matching_lines[1:]:
                 equal_constraint = geometric_constraints.addEqual(base_line, matching_line)
                 if not equal_constraint:
                     raise RuntimeError("Fusion could not add an equal-length OpenLOCK constraint.")
@@ -547,8 +958,8 @@ def _constrain_profile_shape(sketch, lines, arcs_by_corner, reference_line, poin
 
         # The fillet API may already add a radial dimension. If it did not,
         # dimension one arc and use equal-radius constraints for the others.
-        dimensioned_arcs = [arc for arc in arcs_by_corner.values() if _has_radial_dimension(arc)]
-        base_arc = dimensioned_arcs[0] if dimensioned_arcs else next(iter(arcs_by_corner.values()))
+        dimensioned_arcs = [arc for arc in constrained_arcs if _has_radial_dimension(arc)]
+        base_arc = dimensioned_arcs[0] if dimensioned_arcs else constrained_arcs[0]
         if not _has_radial_dimension(base_arc):
             dimension_text = _radial_dimension_text_point(base_arc)
             try:
@@ -565,17 +976,22 @@ def _constrain_profile_shape(sketch, lines, arcs_by_corner, reference_line, poin
                 raise RuntimeError("Fusion could not dimension an OpenLOCK fillet radius.")
             added_constraints.append(radial_dimension)
 
-        for arc in arcs_by_corner.values():
+        for arc in constrained_arcs:
             if arc == base_arc or _has_radial_dimension(arc):
                 continue
-            equal_constraint = geometric_constraints.addEqual(base_arc, arc)
-            if not equal_constraint:
-                raise RuntimeError("Fusion could not add equal-radius OpenLOCK constraints.")
-            added_constraints.append(equal_constraint)
+            # addFillet can already determine the radius of this arc.  In
+            # that case an additional Equal constraint is redundant and
+            # Fusion rejects it as VCS_SKETCH_OVER_CONSTRAINTS.  The base
+            # radial dimension remains the required radius driver; this
+            # relation is only an optional reinforcement.
+            try:
+                equal_constraint = geometric_constraints.addEqual(base_arc, arc)
+            except Exception:
+                equal_constraint = None
+            if equal_constraint:
+                added_constraints.append(equal_constraint)
 
-        for corner_index, arc in arcs_by_corner.items():
-            incoming_line = lines[(corner_index - 1) % len(lines)]
-            outgoing_line = lines[corner_index]
+        for arc, incoming_line, outgoing_line in arc_constraints:
             for adjacent_line in (incoming_line, outgoing_line):
                 tangent_constraint = _add_tangent_constraint(
                     geometric_constraints,
@@ -585,12 +1001,11 @@ def _constrain_profile_shape(sketch, lines, arcs_by_corner, reference_line, poin
                 if tangent_constraint:
                     added_constraints.append(tangent_constraint)
 
-        # Keep the independent angles from the original polygon. At a rounded
+        # Keep the independent angles from the right side. At a rounded
         # vertex, the angle is applied to the supporting lines while the arc is
-        # held by its radius and two tangent constraints.
-        for vertex_index in range(len(lines) - 3):
-            incoming_line = lines[(vertex_index - 1) % len(lines)]
-            outgoing_line = lines[vertex_index]
+        # held by its radius and two tangent constraints. Mirrored angles are
+        # implied by the symmetry constraints and are deliberately omitted.
+        for incoming_line, outgoing_line in angle_pairs:
             previous_start = incoming_line.startSketchPoint.geometry
             incoming_end = incoming_line.endSketchPoint.geometry
             outgoing_start = outgoing_line.startSketchPoint.geometry
@@ -608,27 +1023,38 @@ def _constrain_profile_shape(sketch, lines, arcs_by_corner, reference_line, poin
                     "addPerpendicular2",
                     None,
                 ) or getattr(geometric_constraints, "addPerpendicular", None)
-                if not perpendicular_method:
-                    raise RuntimeError("Fusion does not expose a perpendicular sketch constraint.")
-                angle_constraint = perpendicular_method(incoming_line, outgoing_line)
+                try:
+                    angle_constraint = (
+                        perpendicular_method(incoming_line, outgoing_line)
+                        if perpendicular_method
+                        else None
+                    )
+                except Exception:
+                    angle_constraint = None
             else:
-                angle_constraint = dimensions.addAngularDimension(
-                    incoming_line,
-                    outgoing_line,
-                    _angle_dimension_text_point(incoming_line, outgoing_line),
-                )
+                try:
+                    angle_constraint = dimensions.addAngularDimension(
+                        incoming_line,
+                        outgoing_line,
+                        _angle_dimension_text_point(incoming_line, outgoing_line),
+                    )
+                except Exception:
+                    # An angle can already be implied by the symmetry and
+                    # direction constraints. Fusion rejects that redundant
+                    # dimension as over-constrained; keep the existing relation.
+                    angle_constraint = None
             if not angle_constraint:
-                raise RuntimeError("Fusion could not constrain an OpenLOCK corner angle.")
+                continue
+            if slope_angle_deg is not None and slope_angle_pair is not None and (
+                incoming_line is slope_angle_pair[0]
+                and outgoing_line is slope_angle_pair[1]
+            ):
+                _set_dimension_expression(
+                    angle_constraint,
+                    "{:.6f} deg".format(slope_angle_deg),
+                )
             added_constraints.append(angle_constraint)
 
-        alignment_line = max(lines, key=_line_length_cm)
-        collinear_constraint = geometric_constraints.addCollinear(
-            alignment_line,
-            reference_line,
-        )
-        if not collinear_constraint:
-            raise RuntimeError("Fusion could not align the OpenLOCK profile edge to the reference line.")
-        added_constraints.append(collinear_constraint)
         return added_constraints
     except Exception:
         for constraint in reversed(added_constraints):

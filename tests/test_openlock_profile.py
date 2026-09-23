@@ -7,6 +7,8 @@ from math import atan2, degrees
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "OpenLOCKHole")))
 
 from openlock_profile import (
+    audit_basic_openlock_constraint_plan,
+    basic_openlock_constraint_plan,
     basic_openlock_profile_mm,
     profile_bounds_mm,
     transform_profile_mm,
@@ -86,6 +88,35 @@ class OpenLockProfileTests(unittest.TestCase):
         point_set = {(round(x, 6), round(y, 6)) for x, y in points}
         mirrored = {(-x, y) for x, y in point_set}
         self.assertEqual(point_set, mirrored)
+
+    def test_constraint_plan_preserves_full_dimension_targets(self):
+        plan = basic_openlock_constraint_plan()
+
+        self.assertIn((0, 14), plan["symmetry_line_pairs"])
+        self.assertIn((15, 17), plan["symmetry_line_pairs"])
+        self.assertEqual(plan["centered_line_indices"], (7, 16))
+        self.assertIn(7, plan["independent_line_indices"])
+        self.assertNotIn(2, plan["independent_line_indices"])
+        self.assertNotIn(17, plan["independent_line_indices"])
+        self.assertNotIn(16, plan["independent_line_indices"])
+        self.assertIn(16, plan["parallel_line_indices"])
+        self.assertNotIn(8, plan["independent_line_indices"])
+        self.assertEqual(plan["angle_pairs"], ((0, 1), (3, 4)))
+        self.assertEqual(plan["shoulder_inner_point_line_index"], 4)
+
+    def test_constraint_plan_has_no_duplicate_targets(self):
+        audit = audit_basic_openlock_constraint_plan()
+
+        self.assertTrue(audit["valid"])
+        self.assertEqual(audit["duplicate_targets"], ())
+        self.assertEqual(
+            len(audit["dimension_targets"]),
+            len(set(audit["dimension_targets"])),
+        )
+        self.assertEqual(
+            len(audit["relation_targets"]),
+            len(set(audit["relation_targets"])),
+        )
 
     def test_rotation_90_degrees(self):
         transformed = transform_profile_mm([(1.0, 0.0)], rotation_deg=90.0)
