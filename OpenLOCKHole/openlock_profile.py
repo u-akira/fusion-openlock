@@ -37,6 +37,12 @@ BASIC_OPENLOCK_DIMENSIONS_MM = {
 BASIC_OPENLOCK_FILLET_CORNER_INDICES = (0, 15, 16, 17)
 
 
+def reference_selection_is_ready(selection_count):
+    """Return whether the command has exactly one reference edge selected."""
+
+    return selection_count == 1
+
+
 def basic_openlock_constraint_plan():
     """Return the stable sketch-constraint topology for the basic profile.
 

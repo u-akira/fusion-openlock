@@ -13,12 +13,18 @@ from openlock_profile import (
     basic_openlock_profile_mm,
     point_on_line_through_point_parallel_to_line_mm,
     profile_bounds_mm,
+    reference_selection_is_ready,
     transform_profile_mm,
     transform_profile_to_reference_mm,
 )
 
 
 class OpenLockProfileTests(unittest.TestCase):
+    def test_reference_selection_is_required_before_execution(self):
+        self.assertFalse(reference_selection_is_ready(0))
+        self.assertTrue(reference_selection_is_ready(1))
+        self.assertFalse(reference_selection_is_ready(2))
+
     def test_profile_matches_dimensioned_reference_bounds(self):
         points = basic_openlock_profile_mm()
         min_x, min_y, max_x, max_y = profile_bounds_mm(points)

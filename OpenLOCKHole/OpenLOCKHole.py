@@ -192,7 +192,9 @@ class ValidateInputsHandler(adsk.core.ValidateInputsEventHandler):
 
             args.areInputsValid = bool(
                 reference_edge
-                and reference_edge.selectionCount == 1
+                and _PROFILE["reference_selection_is_ready"](
+                    reference_edge.selectionCount
+                )
             )
 
         except Exception:
@@ -213,6 +215,15 @@ class ExecuteHandler(adsk.core.CommandEventHandler):
             sketch = adsk.fusion.Sketch.cast(design.activeEditObject)
             if not sketch:
                 raise RuntimeError("Edit a sketch before adding an OpenLOCK profile.")
+
+            reference_edge = inputs.itemById("referenceEdge")
+            if not reference_edge or not _PROFILE["reference_selection_is_ready"](
+                reference_edge.selectionCount
+            ):
+                # Fusion can still dispatch Execute in some command states even
+                # while ValidateInputs has marked the empty selection invalid.
+                # Treat that state as a no-op instead of surfacing a traceback.
+                return
 
             profile, points_mm, origin_mm, rotation_deg, flip, offset_mm, reference_line = (
                 _reference_profile_placement(sketch, inputs)
@@ -327,7 +338,9 @@ class PreviewHandler(adsk.core.CommandEventHandler):
 
             inputs = args.command.commandInputs
             reference_edge = inputs.itemById("referenceEdge")
-            if not reference_edge or reference_edge.selectionCount != 1:
+            if not reference_edge or not _PROFILE["reference_selection_is_ready"](
+                reference_edge.selectionCount
+            ):
                 args.isValidResult = False
                 return
 
@@ -350,7 +363,9 @@ class PreviewHandler(adsk.core.CommandEventHandler):
 
 def _reference_profile_placement(sketch, inputs):
     reference_edge = inputs.itemById("referenceEdge")
-    if not reference_edge or reference_edge.selectionCount != 1:
+    if not reference_edge or not _PROFILE["reference_selection_is_ready"](
+        reference_edge.selectionCount
+    ):
         raise RuntimeError("Select one sketch line as the reference edge.")
 
     selected_line = adsk.fusion.SketchLine.cast(reference_edge.selection(0).entity)
